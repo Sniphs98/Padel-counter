@@ -4,7 +4,7 @@
 // ── Einstellungen ─────────────────────────────────────
 #define MAX_REMOTES      4      // Anzahl der BLE Remotes
 #define SCAN_DURATION    15     // Sekunden zum Suchen beim Start
-#define COOLDOWN_MS      10000  // Wartezeit nach einem Punkt (ms)
+#define COOLDOWN_MS      7000  // Wartezeit nach einem Punkt (ms)
 #define UNDO_COOLDOWN_MS 5000   // Wartezeit nach einem Undo (ms)
 #define MAX_UNDO_HISTORY 10     // Wie viele Punkte man zurück kann
 
