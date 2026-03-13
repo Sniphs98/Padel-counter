@@ -9,9 +9,10 @@ uint16_t clrWhite, clrGreen, clrRed, clrYellow, clrCyan;
 // ── Einstellungen ─────────────────────────────────────
 #define MAX_REMOTES      4      // Anzahl der BLE Remotes
 #define SCAN_DURATION    15     // Sekunden zum Suchen beim Start
-#define COOLDOWN_MS      7000  // Wartezeit nach einem Punkt (ms)
+#define COOLDOWN_MS      7000   // Wartezeit nach einem Punkt (ms)
 #define UNDO_COOLDOWN_MS 5000   // Wartezeit nach einem Undo (ms)
 #define MAX_UNDO_HISTORY 10     // Wie viele Punkte man zurück kann
+#define DISPLAY_BRIGHTNESS 20   // Display-Helligkeit (0-255), niedrig = stromsparend
 
 // ── Padel Config ──────────────────────────────────────
 bool advantageEnabled = true;  // false = Golden Point bei Deuce (40:40)
@@ -431,13 +432,14 @@ void setup() {
 
   // Display initialisieren
   HUB75_I2S_CFG mxconfig(64, 32, 1);
+  mxconfig.driver = HUB75_I2S_CFG::FM6126A;  // bei Ghosting probieren; bei falschen Farben wieder entfernen
   dma_display = new MatrixPanel_I2S_DMA(mxconfig);
   dma_display->begin();
-  dma_display->setBrightness8(80);
+  dma_display->setBrightness8(DISPLAY_BRIGHTNESS);
   clrWhite  = dma_display->color565(255, 255, 255);
   clrGreen  = dma_display->color565(0,   255, 0);
   clrRed    = dma_display->color565(255, 50,  50);
-  clrYellow = dma_display->color565(255, 255, 0);
+  clrYellow = dma_display->color565(180, 180, 0);
   clrCyan   = dma_display->color565(0,   200, 255);
   dma_display->clearScreen();
   dma_display->setTextSize(1);
