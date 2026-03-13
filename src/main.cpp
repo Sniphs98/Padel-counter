@@ -1,5 +1,10 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+
+// ── Display ───────────────────────────────────────────
+MatrixPanel_I2S_DMA *dma_display = nullptr;
+uint16_t clrWhite, clrGreen, clrRed, clrYellow, clrCyan;
 
 // ── Einstellungen ─────────────────────────────────────
 #define MAX_REMOTES      4      // Anzahl der BLE Remotes
@@ -53,6 +58,96 @@ const char* pointStr(int p) {
   }
 }
 
+void updateDisplay() {
+  if (!dma_display) return;
+  dma_display->clearScreen();
+  dma_display->setTextSize(1);
+  dma_display->setTextWrap(false);
+  char buf[16];
+
+  if (phase == TEAM_SELECTION) {
+    int cntA = 0, cntB = 0;
+    for (int i = 0; i < MAX_REMOTES; i++) {
+      if (playerAssigned[i]) { if (teamOf[i] == 0) cntA++; else cntB++; }
+    }
+    dma_display->setTextColor(clrYellow);
+    dma_display->setCursor(5, 2);  dma_display->print("TEAM WAHL");
+    dma_display->setTextColor(clrGreen);
+    dma_display->setCursor(8, 13); snprintf(buf, sizeof(buf), "A: %d/2", cntA); dma_display->print(buf);
+    dma_display->setTextColor(clrRed);
+    dma_display->setCursor(8, 23); snprintf(buf, sizeof(buf), "B: %d/2", cntB); dma_display->print(buf);
+    return;
+  }
+
+  if (phase == MATCH_OVER) {
+    dma_display->setTextColor(clrYellow);
+    dma_display->setCursor(17, 3); dma_display->print("MATCH");
+    dma_display->setTextColor(score.matchWinner == 0 ? clrGreen : clrRed);
+    dma_display->setCursor(14, 13);
+    snprintf(buf, sizeof(buf), "Team %s", score.matchWinner == 0 ? "A" : "B");
+    dma_display->print(buf);
+    dma_display->setTextColor(clrWhite);
+    dma_display->setCursor(11, 23); dma_display->print("gewinnt");
+    return;
+  }
+
+  // ── PLAYING ──
+  // Zeile 1: Satz
+  dma_display->setTextColor(clrYellow);
+  dma_display->setCursor(0, 1);  dma_display->print("SAT");
+  dma_display->setTextColor(clrGreen);
+  dma_display->setCursor(28, 1); snprintf(buf, sizeof(buf), "%d", score.sets[0]); dma_display->print(buf);
+  dma_display->setTextColor(clrWhite);
+  dma_display->setCursor(36, 1); dma_display->print("-");
+  dma_display->setTextColor(clrRed);
+  dma_display->setCursor(46, 1); snprintf(buf, sizeof(buf), "%d", score.sets[1]); dma_display->print(buf);
+
+  // Zeile 2: Spiel
+  dma_display->setTextColor(clrYellow);
+  dma_display->setCursor(0, 12); dma_display->print("SPL");
+  dma_display->setTextColor(clrGreen);
+  dma_display->setCursor(28, 12); snprintf(buf, sizeof(buf), "%d", score.games[0]); dma_display->print(buf);
+  dma_display->setTextColor(clrWhite);
+  dma_display->setCursor(36, 12); dma_display->print("-");
+  dma_display->setTextColor(clrRed);
+  dma_display->setCursor(46, 12); snprintf(buf, sizeof(buf), "%d", score.games[1]); dma_display->print(buf);
+
+  // Zeile 3: Punkte
+  if (score.inTiebreak) {
+    dma_display->setTextColor(clrCyan);
+    dma_display->setCursor(0, 23); dma_display->print("TB");
+    int tbA = score.points[0], tbB = score.points[1];
+    dma_display->setTextColor(clrGreen);
+    dma_display->setCursor(tbA >= 10 ? 22 : 28, 23);
+    snprintf(buf, sizeof(buf), "%d", tbA); dma_display->print(buf);
+    dma_display->setTextColor(clrWhite);
+    dma_display->setCursor(36, 23); dma_display->print("-");
+    dma_display->setTextColor(clrRed);
+    dma_display->setCursor(46, 23); snprintf(buf, sizeof(buf), "%d", tbB); dma_display->print(buf);
+  } else if (score.points[0] >= 3 && score.points[1] >= 3) {
+    if (score.advantage == -1) {
+      dma_display->setTextColor(clrYellow);
+      dma_display->setCursor(17, 23); dma_display->print("DEUCE");
+    } else {
+      dma_display->setTextColor(score.advantage == 0 ? clrGreen : clrRed);
+      dma_display->setCursor(17, 23);
+      snprintf(buf, sizeof(buf), "ADV %s", score.advantage == 0 ? "A" : "B");
+      dma_display->print(buf);
+    }
+  } else {
+    dma_display->setTextColor(clrYellow);
+    dma_display->setCursor(0, 23); dma_display->print("PKT");
+    const char* pA = pointStr(score.points[0]);
+    const char* pB = pointStr(score.points[1]);
+    dma_display->setTextColor(clrGreen);
+    dma_display->setCursor(strlen(pA) == 1 ? 28 : 22, 23); dma_display->print(pA);
+    dma_display->setTextColor(clrWhite);
+    dma_display->setCursor(36, 23); dma_display->print("-");
+    dma_display->setTextColor(clrRed);
+    dma_display->setCursor(46, 23); dma_display->print(pB);
+  }
+}
+
 void printScore() {
   Serial.println();
   Serial.printf("  Sätze:  A:%d - B:%d\n", score.sets[0], score.sets[1]);
@@ -70,6 +165,7 @@ void printScore() {
                   pointStr(score.points[0]), pointStr(score.points[1]));
   }
   Serial.println();
+  updateDisplay();
 }
 
 // ── Undo ──────────────────────────────────────────────
@@ -148,6 +244,7 @@ void winSet(int team) {
     Serial.printf( "  ║   Team %s gewinnt!        ║\n", team == 0 ? "A" : "B");
     Serial.printf( "  ║   Sätze  %d:%d             ║\n", score.sets[0], score.sets[1]);
     Serial.println("  ╚══════════════════════════╝\n");
+    updateDisplay();
   } else {
     printScore();
   }
@@ -203,6 +300,7 @@ void onButtonPress(int playerIndex) {
     Serial.printf("Spieler %d → Team %s (%d/2)\n",
                   playerIndex + 1, team == 0 ? "A" : "B",
                   team == 0 ? assignedCount : assignedCount - 2);
+    updateDisplay();
 
     if (assignedCount == (int)foundAddresses.size()) {
       Serial.println("\n=== Teams komplett! Spiel beginnt! ===");
@@ -331,6 +429,24 @@ void setup() {
   Serial.printf("Vorteil-Regel: %s\n", advantageEnabled ? "AN" : "AUS (Golden Point)");
   Serial.printf("Schalte alle %d Remotes ein! Scan läuft %d Sek...\n", MAX_REMOTES, SCAN_DURATION);
 
+  // Display initialisieren
+  HUB75_I2S_CFG mxconfig(64, 32, 1);
+  dma_display = new MatrixPanel_I2S_DMA(mxconfig);
+  dma_display->begin();
+  dma_display->setBrightness8(80);
+  clrWhite  = dma_display->color565(255, 255, 255);
+  clrGreen  = dma_display->color565(0,   255, 0);
+  clrRed    = dma_display->color565(255, 50,  50);
+  clrYellow = dma_display->color565(255, 255, 0);
+  clrCyan   = dma_display->color565(0,   200, 255);
+  dma_display->clearScreen();
+  dma_display->setTextSize(1);
+  dma_display->setTextWrap(false);
+  dma_display->setTextColor(clrYellow);
+  dma_display->setCursor(13, 8);  dma_display->print("Padel");
+  dma_display->setTextColor(clrWhite);
+  dma_display->setCursor(1, 20);  dma_display->print("Scan laeuft..");
+
   NimBLEDevice::init("ESP32_Padel");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
@@ -354,6 +470,7 @@ void setup() {
   }
 
   Serial.println("\n=== Team-Wahl: Erste 2 die drücken = Team A, letzte 2 = Team B ===\n");
+  updateDisplay();
 }
 
 void loop() {
