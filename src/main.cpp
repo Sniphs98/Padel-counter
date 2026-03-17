@@ -1,10 +1,32 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
+#include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <TelnetStream.h>
+
+// ── WiFi / OTA ────────────────────────────────────────
+#include "credentials.h"  // nicht in Git — siehe credentials.h.example
+
+// ── Log-Helper: Serial + Telnet gleichzeitig ──────────
+void logf(const char* fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.print(buf);
+  TelnetStream.print(buf);
+}
+
+void logln(const char* msg = "") {
+  Serial.println(msg);
+  TelnetStream.println(msg);
+}
 
 // ── Display ───────────────────────────────────────────
 MatrixPanel_I2S_DMA *dma_display = nullptr;
-uint16_t clrWhite, clrGreen, clrRed, clrYellow, clrCyan;
+uint16_t clrWhite, clrBlack, clrGreen, clrRed, clrYellow, clrCyan;
 
 // ── Einstellungen ─────────────────────────────────────
 #define MAX_REMOTES      4      // Anzahl der BLE Remotes
@@ -15,7 +37,7 @@ uint16_t clrWhite, clrGreen, clrRed, clrYellow, clrCyan;
 #define DISPLAY_BRIGHTNESS 20   // Display-Helligkeit (0-255), niedrig = stromsparend
 
 // ── Padel Config ──────────────────────────────────────
-bool advantageEnabled = true;  // false = Golden Point bei Deuce (40:40)
+bool advantageEnabled = false;  // false = Golden Point bei Deuce (40:40)
 
 // ── BLE ───────────────────────────────────────────────
 static NimBLEUUID hidServiceUUID((uint16_t)0x1812);
@@ -34,7 +56,7 @@ int  teamOf[MAX_REMOTES];
 bool playerAssigned[MAX_REMOTES] = {false};
 int  assignedCount = 0;
 
-unsigned long lastPointTime = 0;
+unsigned long lastPointTime[2] = {0, 0};
 unsigned long lastUndoTime  = 0;
 
 struct PadelScore {
@@ -49,6 +71,10 @@ struct PadelScore {
 std::vector<PadelScore> undoStack;
 
 // ── Anzeige ───────────────────────────────────────────
+bool isTeamInCooldown(int team) {
+  return phase == PLAYING && (long)(millis() - lastPointTime[team]) < COOLDOWN_MS;
+}
+
 const char* pointStr(int p) {
   switch (p) {
     case 0: return "0";
@@ -93,39 +119,50 @@ void updateDisplay() {
   }
 
   // ── PLAYING ──
+  bool cdA = isTeamInCooldown(0);
+  bool cdB = isTeamInCooldown(1);
+
+  // Cooldown-Highlight: weiße Box hinter den Score-Zahlen des Teams im Cooldown
+  // Team A: x=21..34, Team B: x=44..59 — "-" bei x=36 bleibt frei
+  if (cdA) { dma_display->fillRect(21, 0,  14, 10, clrWhite); dma_display->fillRect(21, 11, 14, 10, clrWhite); }
+  if (cdB) { dma_display->fillRect(44, 0,  16, 10, clrWhite); dma_display->fillRect(44, 11, 16, 10, clrWhite); }
+
   // Zeile 1: Satz
   dma_display->setTextColor(clrYellow);
   dma_display->setCursor(0, 1);  dma_display->print("SAT");
-  dma_display->setTextColor(clrGreen);
+  dma_display->setTextColor(cdA ? clrBlack : clrGreen);
   dma_display->setCursor(28, 1); snprintf(buf, sizeof(buf), "%d", score.sets[0]); dma_display->print(buf);
   dma_display->setTextColor(clrWhite);
   dma_display->setCursor(36, 1); dma_display->print("-");
-  dma_display->setTextColor(clrRed);
+  dma_display->setTextColor(cdB ? clrBlack : clrRed);
   dma_display->setCursor(46, 1); snprintf(buf, sizeof(buf), "%d", score.sets[1]); dma_display->print(buf);
 
   // Zeile 2: Spiel
   dma_display->setTextColor(clrYellow);
   dma_display->setCursor(0, 12); dma_display->print("SPL");
-  dma_display->setTextColor(clrGreen);
+  dma_display->setTextColor(cdA ? clrBlack : clrGreen);
   dma_display->setCursor(28, 12); snprintf(buf, sizeof(buf), "%d", score.games[0]); dma_display->print(buf);
   dma_display->setTextColor(clrWhite);
   dma_display->setCursor(36, 12); dma_display->print("-");
-  dma_display->setTextColor(clrRed);
+  dma_display->setTextColor(cdB ? clrBlack : clrRed);
   dma_display->setCursor(46, 12); snprintf(buf, sizeof(buf), "%d", score.games[1]); dma_display->print(buf);
 
   // Zeile 3: Punkte
   if (score.inTiebreak) {
+    if (cdA) dma_display->fillRect(21, 22, 14, 10, clrWhite);
+    if (cdB) dma_display->fillRect(44, 22, 16, 10, clrWhite);
     dma_display->setTextColor(clrCyan);
     dma_display->setCursor(0, 23); dma_display->print("TB");
     int tbA = score.points[0], tbB = score.points[1];
-    dma_display->setTextColor(clrGreen);
+    dma_display->setTextColor(cdA ? clrBlack : clrGreen);
     dma_display->setCursor(tbA >= 10 ? 22 : 28, 23);
     snprintf(buf, sizeof(buf), "%d", tbA); dma_display->print(buf);
     dma_display->setTextColor(clrWhite);
     dma_display->setCursor(36, 23); dma_display->print("-");
-    dma_display->setTextColor(clrRed);
+    dma_display->setTextColor(cdB ? clrBlack : clrRed);
     dma_display->setCursor(46, 23); snprintf(buf, sizeof(buf), "%d", tbB); dma_display->print(buf);
   } else if (score.points[0] >= 3 && score.points[1] >= 3) {
+    // Deuce/ADV: kein per-Team-Highlight (Text ist zentriert)
     if (score.advantage == -1) {
       dma_display->setTextColor(clrYellow);
       dma_display->setCursor(17, 23); dma_display->print("DEUCE");
@@ -136,36 +173,38 @@ void updateDisplay() {
       dma_display->print(buf);
     }
   } else {
+    if (cdA) dma_display->fillRect(21, 22, 14, 10, clrWhite);
+    if (cdB) dma_display->fillRect(44, 22, 16, 10, clrWhite);
     dma_display->setTextColor(clrYellow);
     dma_display->setCursor(0, 23); dma_display->print("PKT");
     const char* pA = pointStr(score.points[0]);
     const char* pB = pointStr(score.points[1]);
-    dma_display->setTextColor(clrGreen);
+    dma_display->setTextColor(cdA ? clrBlack : clrGreen);
     dma_display->setCursor(strlen(pA) == 1 ? 28 : 22, 23); dma_display->print(pA);
     dma_display->setTextColor(clrWhite);
     dma_display->setCursor(36, 23); dma_display->print("-");
-    dma_display->setTextColor(clrRed);
+    dma_display->setTextColor(cdB ? clrBlack : clrRed);
     dma_display->setCursor(46, 23); dma_display->print(pB);
   }
 }
 
 void printScore() {
-  Serial.println();
-  Serial.printf("  Sätze:  A:%d - B:%d\n", score.sets[0], score.sets[1]);
-  Serial.printf("  Spiele: A:%d - B:%d\n", score.games[0], score.games[1]);
+  logln();
+  logf("  Sätze:  A:%d - B:%d\n", score.sets[0], score.sets[1]);
+  logf("  Spiele: A:%d - B:%d\n", score.games[0], score.games[1]);
 
   if (score.inTiebreak) {
-    Serial.printf("  Tiebreak: A:%d - B:%d\n", score.points[0], score.points[1]);
+    logf("  Tiebreak: A:%d - B:%d\n", score.points[0], score.points[1]);
   } else if (score.points[0] >= 3 && score.points[1] >= 3) {
     if (score.advantage == -1)
-      Serial.println("  Punkte:  Deuce");
+      logln("  Punkte:  Deuce");
     else
-      Serial.printf("  Punkte:  Vorteil Team %s\n", score.advantage == 0 ? "A" : "B");
+      logf("  Punkte:  Vorteil Team %s\n", score.advantage == 0 ? "A" : "B");
   } else {
-    Serial.printf("  Punkte: A:%s - B:%s\n",
+    logf("  Punkte: A:%s - B:%s\n",
                   pointStr(score.points[0]), pointStr(score.points[1]));
   }
-  Serial.println();
+  logln();
   updateDisplay();
 }
 
@@ -180,18 +219,18 @@ void undoLastPoint() {
   unsigned long now = millis();
   long remaining = UNDO_COOLDOWN_MS - (long)(now - lastUndoTime);
   if (remaining > 0) {
-    Serial.printf("Undo: Cooldown noch %ld Sek.\n", (remaining / 1000) + 1);
+    logf("Undo: Cooldown noch %ld Sek.\n", (remaining / 1000) + 1);
     return;
   }
   if (undoStack.empty()) {
-    Serial.println("Undo: Kein Punkt zum Rückgängigmachen!");
+    logln("Undo: Kein Punkt zum Rückgängigmachen!");
     return;
   }
   lastUndoTime = now;
   score = undoStack.back();
   undoStack.pop_back();
   phase = (score.matchWinner >= 0) ? MATCH_OVER : PLAYING;
-  Serial.println("<<< Letzter Punkt rückgängig gemacht! >>>");
+  logln("<<< Letzter Punkt rückgängig gemacht! >>>");
   printScore();
 }
 
@@ -210,7 +249,7 @@ void winGame(int team) {
 
   if (g == 6 && go == 6) {
     score.inTiebreak = true;
-    Serial.println("  === TIEBREAK! ===");
+    logln("  === TIEBREAK! ===");
     printScore();
     return;
   }
@@ -233,18 +272,18 @@ void winSet(int team) {
   score.advantage  = -1;
   score.inTiebreak = false;
 
-  Serial.printf("\n*** Satz gewonnen! Team %s | Satzstand %d:%d ***\n",
+  logf("\n*** Satz gewonnen! Team %s | Satzstand %d:%d ***\n",
                 team == 0 ? "A" : "B", score.sets[0], score.sets[1]);
 
   if (score.sets[team] == 2) {
     phase = MATCH_OVER;
     score.matchWinner = team;
-    Serial.println();
-    Serial.println("  ╔══════════════════════════╗");
-    Serial.printf( "  ║   MATCH GEWONNEN!        ║\n");
-    Serial.printf( "  ║   Team %s gewinnt!        ║\n", team == 0 ? "A" : "B");
-    Serial.printf( "  ║   Sätze  %d:%d             ║\n", score.sets[0], score.sets[1]);
-    Serial.println("  ╚══════════════════════════╝\n");
+    logln();
+    logln("  ╔══════════════════════════╗");
+    logf( "  ║   MATCH GEWONNEN!        ║\n");
+    logf( "  ║   Team %s gewinnt!        ║\n", team == 0 ? "A" : "B");
+    logf( "  ║   Sätze  %d:%d             ║\n", score.sets[0], score.sets[1]);
+    logln("  ╚══════════════════════════╝\n");
     updateDisplay();
   } else {
     printScore();
@@ -298,21 +337,21 @@ void onButtonPress(int playerIndex) {
     teamOf[playerIndex] = team;
     assignedCount++;
 
-    Serial.printf("Spieler %d → Team %s (%d/2)\n",
+    logf("Spieler %d → Team %s (%d/2)\n",
                   playerIndex + 1, team == 0 ? "A" : "B",
                   team == 0 ? assignedCount : assignedCount - 2);
     updateDisplay();
 
     if (assignedCount == (int)foundAddresses.size()) {
-      Serial.println("\n=== Teams komplett! Spiel beginnt! ===");
-      Serial.print("  Team A: ");
+      logln("\n=== Teams komplett! Spiel beginnt! ===");
+      logf("  Team A: ");
       for (int i = 0; i < MAX_REMOTES; i++)
-        if (playerAssigned[i] && teamOf[i] == 0) Serial.printf("Spieler %d ", i + 1);
-      Serial.println();
-      Serial.print("  Team B: ");
+        if (playerAssigned[i] && teamOf[i] == 0) logf("Spieler %d ", i + 1);
+      logln();
+      logf("  Team B: ");
       for (int i = 0; i < MAX_REMOTES; i++)
-        if (playerAssigned[i] && teamOf[i] == 1) Serial.printf("Spieler %d ", i + 1);
-      Serial.println();
+        if (playerAssigned[i] && teamOf[i] == 1) logf("Spieler %d ", i + 1);
+      logln();
       phase = PLAYING;
       printScore();
     }
@@ -320,24 +359,24 @@ void onButtonPress(int playerIndex) {
   }
 
   if (phase == MATCH_OVER) {
-    Serial.println("Match vorbei! ESP32 neu starten für neues Spiel.");
+    logln("Match vorbei! ESP32 neu starten für neues Spiel.");
     return;
   }
 
   // Cooldown
   unsigned long now = millis();
-  long remaining = COOLDOWN_MS - (long)(now - lastPointTime);
   int team = teamOf[playerIndex];
+  long remaining = COOLDOWN_MS - (long)(now - lastPointTime[team]);
 
   if (remaining > 0) {
-    Serial.printf("Team %s: Cooldown noch %ld Sek.\n",
+    logf("Team %s: Cooldown noch %ld Sek.\n",
                   team == 0 ? "A" : "B", (remaining / 1000) + 1);
     return;
   }
 
-  lastPointTime = now;
+  lastPointTime[team] = now;
   pushUndo();
-  Serial.printf(">>> Team %s: Punkt! <<<\n", team == 0 ? "A" : "B");
+  logf(">>> Team %s: Punkt! <<<\n", team == 0 ? "A" : "B");
   scorePoint(team);
 }
 
@@ -371,9 +410,9 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t le
     bool anyNonZero = false;
     for (int i = 0; i < length; i++) if (pData[i] != 0x00) { anyNonZero = true; break; }
     if (anyNonZero) {
-      Serial.printf("[Spieler %d] Unbekannter HID Code: ", playerIndex + 1);
-      for (int i = 0; i < length; i++) Serial.printf("%02X ", pData[i]);
-      Serial.println();
+      logf("[Spieler %d] Unbekannter HID Code: ", playerIndex + 1);
+      for (int i = 0; i < length; i++) logf("%02X ", pData[i]);
+      logln();
     }
     return;
   }
@@ -386,13 +425,13 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t le
 
 bool connectRemote(int index) {
   NimBLEAddress addr = foundAddresses[index];
-  Serial.printf("Verbinde Spieler %d (%s)...\n", index + 1, addr.toString().c_str());
+  logf("Verbinde Spieler %d (%s)...\n", index + 1, addr.toString().c_str());
 
   if (clients[index] == nullptr)
     clients[index] = NimBLEDevice::createClient();
 
   if (!clients[index]->connect(addr)) {
-    Serial.printf("Verbindung zu Spieler %d fehlgeschlagen!\n", index + 1);
+    logf("Verbindung zu Spieler %d fehlgeschlagen!\n", index + 1);
     return false;
   }
 
@@ -408,7 +447,7 @@ bool connectRemote(int index) {
   }
 
   clientConnected[index] = true;
-  Serial.printf("Spieler %d verbunden!\n", index + 1);
+  logf("Spieler %d verbunden!\n", index + 1);
   return true;
 }
 
@@ -418,7 +457,7 @@ class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
     if ((int)foundAddresses.size() >= MAX_REMOTES) return;
     NimBLEAddress addr = dev->getAddress();
     for (auto& a : foundAddresses) if (a == addr) return;
-    Serial.printf("Remote %d gefunden: %s\n", (int)foundAddresses.size() + 1, addr.toString().c_str());
+    logf("Remote %d gefunden: %s\n", (int)foundAddresses.size() + 1, addr.toString().c_str());
     foundAddresses.push_back(addr);
   }
 };
@@ -427,8 +466,6 @@ class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
 void setup() {
   Serial.begin(921600);
   Serial.println("\n=== Padel Counter ===");
-  Serial.printf("Vorteil-Regel: %s\n", advantageEnabled ? "AN" : "AUS (Golden Point)");
-  Serial.printf("Schalte alle %d Remotes ein! Scan läuft %d Sek...\n", MAX_REMOTES, SCAN_DURATION);
 
   // Display initialisieren
   HUB75_I2S_CFG mxconfig(64, 32, 1);
@@ -437,17 +474,59 @@ void setup() {
   dma_display->begin();
   dma_display->setBrightness8(DISPLAY_BRIGHTNESS);
   clrWhite  = dma_display->color565(255, 255, 255);
+  clrBlack  = 0;
   clrGreen  = dma_display->color565(0,   255, 0);
   clrRed    = dma_display->color565(255, 50,  50);
   clrYellow = dma_display->color565(180, 180, 0);
   clrCyan   = dma_display->color565(0,   200, 255);
+
+  // WiFi verbinden
   dma_display->clearScreen();
   dma_display->setTextSize(1);
   dma_display->setTextWrap(false);
   dma_display->setTextColor(clrYellow);
   dma_display->setCursor(13, 8);  dma_display->print("Padel");
-  dma_display->setTextColor(clrWhite);
-  dma_display->setCursor(1, 20);  dma_display->print("Scan laeuft..");
+  dma_display->setTextColor(clrCyan);
+  dma_display->setCursor(4, 20);  dma_display->print("WiFi...");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("WiFi verbinde mit %s", WIFI_SSID);
+  int wifiRetry = 0;
+  while (WiFi.status() != WL_CONNECTED && wifiRetry < 20) {
+    delay(500);
+    Serial.print(".");
+    wifiRetry++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nWiFi verbunden! IP: %s\n", WiFi.localIP().toString().c_str());
+
+    // OTA konfigurieren
+    ArduinoOTA.setHostname("padel-counter");
+    ArduinoOTA.setPassword(OTA_PASS);
+    ArduinoOTA.onStart([]() {
+      logln("OTA: Flash startet...");
+    });
+    ArduinoOTA.onEnd([]() {
+      logln("\nOTA: Fertig! Neustart...");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+      logf("OTA: %u%%\r", progress / (total / 100));
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+      logf("OTA Fehler [%u]\n", error);
+    });
+    ArduinoOTA.begin();
+
+    // Telnet Console starten (Port 23)
+    TelnetStream.begin(23);
+    logln("Telnet Console aktiv (Port 23)");
+  } else {
+    Serial.println("\nWiFi fehlgeschlagen — OTA/Telnet nicht verfügbar.");
+  }
+
+  logf("Vorteil-Regel: %s\n", advantageEnabled ? "AN" : "AUS (Golden Point)");
+  logf("Schalte alle %d Remotes ein! Scan läuft %d Sek...\n", MAX_REMOTES, SCAN_DURATION);
 
   NimBLEDevice::init("ESP32_Padel");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
@@ -457,12 +536,30 @@ void setup() {
   pScan->setActiveScan(true);
   pScan->setInterval(100);
   pScan->setWindow(99);
-  pScan->start(SCAN_DURATION, false);
 
-  Serial.printf("\n%d Remote(s) gefunden.\n", (int)foundAddresses.size());
+  // Scan sekündlich mit Display-Update
+  for (int t = SCAN_DURATION; t > 0; t--) {
+    dma_display->clearScreen();
+    dma_display->setTextSize(1);
+    dma_display->setTextWrap(false);
+    char buf[20];
+    dma_display->setTextColor(clrYellow);
+    dma_display->setCursor(13, 2); dma_display->print("Padel");
+    dma_display->setTextColor(clrGreen);
+    snprintf(buf, sizeof(buf), "Remote: %d/%d", (int)foundAddresses.size(), MAX_REMOTES);
+    dma_display->setCursor(0, 13); dma_display->print(buf);
+    dma_display->setTextColor(clrWhite);
+    snprintf(buf, sizeof(buf), "Noch: %ds", t);
+    dma_display->setCursor(0, 23); dma_display->print(buf);
+    pScan->start(1, t < SCAN_DURATION);
+    ArduinoOTA.handle();
+    if ((int)foundAddresses.size() >= MAX_REMOTES) break;
+  }
+
+  logf("\n%d Remote(s) gefunden.\n", (int)foundAddresses.size());
 
   if (foundAddresses.empty()) {
-    Serial.println("Keine Remotes gefunden! ESP32 neu starten.");
+    logln("Keine Remotes gefunden! ESP32 neu starten.");
     return;
   }
 
@@ -471,14 +568,30 @@ void setup() {
     delay(300);
   }
 
-  Serial.println("\n=== Team-Wahl: Erste 2 die drücken = Team A, letzte 2 = Team B ===\n");
+  logln("\n=== Team-Wahl: Erste 2 die drücken = Team A, letzte 2 = Team B ===\n");
   updateDisplay();
 }
 
 void loop() {
+  ArduinoOTA.handle();
+
+  // Eingehende Telnet-Bytes verwerfen (nur Ausgabe, keine Eingabe)
+  while (TelnetStream.available()) TelnetStream.read();
+
+  // Display aktualisieren wenn Cooldown abläuft
+  static bool wasCdA = false, wasCdB = false;
+  bool cdA = isTeamInCooldown(0);
+  bool cdB = isTeamInCooldown(1);
+  if (wasCdA != cdA || wasCdB != cdB) {
+    wasCdA = cdA;
+    wasCdB = cdB;
+    updateDisplay();
+  }
+
   for (int i = 0; i < (int)foundAddresses.size(); i++) {
-    if (clientConnected[i] && clients[i] != nullptr && !clients[i]->isConnected()) {
-      Serial.printf("Spieler %d getrennt! Reconnect...\n", i + 1);
+    bool connected = clientConnected[i] && clients[i] != nullptr && clients[i]->isConnected();
+    if (!connected) {
+      if (clientConnected[i]) logf("Spieler %d getrennt! Reconnect...\n", i + 1);
       clientConnected[i] = false;
       delay(1000);
       connectRemote(i);
