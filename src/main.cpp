@@ -35,6 +35,7 @@ uint16_t clrWhite, clrBlack, clrGreen, clrRed, clrYellow, clrCyan;
 #define UNDO_COOLDOWN_MS 5000   // Wartezeit nach einem Undo (ms)
 #define MAX_UNDO_HISTORY 10     // Wie viele Punkte man zurück kann
 #define DISPLAY_BRIGHTNESS 20   // Display-Helligkeit (0-255), niedrig = stromsparend
+#define RESET_BUTTON_PIN   32   // Reset-Button für neues Spiel (GPIO32)
 
 // ── Padel Config ──────────────────────────────────────
 bool advantageEnabled = false;  // false = Golden Point bei Deuce (40:40)
@@ -122,44 +123,37 @@ void updateDisplay() {
   bool cdA = isTeamInCooldown(0);
   bool cdB = isTeamInCooldown(1);
 
-  // Cooldown-Highlight: weiße Box hinter den Score-Zahlen des Teams im Cooldown
-  // Team A: x=21..34, Team B: x=44..59 — "-" bei x=36 bleibt frei
-  if (cdA) { dma_display->fillRect(21, 0,  14, 10, clrWhite); dma_display->fillRect(21, 11, 14, 10, clrWhite); }
-  if (cdB) { dma_display->fillRect(44, 0,  16, 10, clrWhite); dma_display->fillRect(44, 11, 16, 10, clrWhite); }
-
   // Zeile 1: Satz
   dma_display->setTextColor(clrYellow);
   dma_display->setCursor(0, 1);  dma_display->print("SAT");
-  dma_display->setTextColor(cdA ? clrBlack : clrGreen);
+  dma_display->setTextColor(cdA ? clrWhite : clrGreen);
   dma_display->setCursor(28, 1); snprintf(buf, sizeof(buf), "%d", score.sets[0]); dma_display->print(buf);
   dma_display->setTextColor(clrWhite);
   dma_display->setCursor(36, 1); dma_display->print("-");
-  dma_display->setTextColor(cdB ? clrBlack : clrRed);
+  dma_display->setTextColor(cdB ? clrWhite : clrRed);
   dma_display->setCursor(46, 1); snprintf(buf, sizeof(buf), "%d", score.sets[1]); dma_display->print(buf);
 
   // Zeile 2: Spiel
   dma_display->setTextColor(clrYellow);
   dma_display->setCursor(0, 12); dma_display->print("SPL");
-  dma_display->setTextColor(cdA ? clrBlack : clrGreen);
+  dma_display->setTextColor(cdA ? clrWhite : clrGreen);
   dma_display->setCursor(28, 12); snprintf(buf, sizeof(buf), "%d", score.games[0]); dma_display->print(buf);
   dma_display->setTextColor(clrWhite);
   dma_display->setCursor(36, 12); dma_display->print("-");
-  dma_display->setTextColor(cdB ? clrBlack : clrRed);
+  dma_display->setTextColor(cdB ? clrWhite : clrRed);
   dma_display->setCursor(46, 12); snprintf(buf, sizeof(buf), "%d", score.games[1]); dma_display->print(buf);
 
   // Zeile 3: Punkte
   if (score.inTiebreak) {
-    if (cdA) dma_display->fillRect(21, 22, 14, 10, clrWhite);
-    if (cdB) dma_display->fillRect(44, 22, 16, 10, clrWhite);
     dma_display->setTextColor(clrCyan);
     dma_display->setCursor(0, 23); dma_display->print("TB");
     int tbA = score.points[0], tbB = score.points[1];
-    dma_display->setTextColor(cdA ? clrBlack : clrGreen);
+    dma_display->setTextColor(cdA ? clrWhite : clrGreen);
     dma_display->setCursor(tbA >= 10 ? 22 : 28, 23);
     snprintf(buf, sizeof(buf), "%d", tbA); dma_display->print(buf);
     dma_display->setTextColor(clrWhite);
     dma_display->setCursor(36, 23); dma_display->print("-");
-    dma_display->setTextColor(cdB ? clrBlack : clrRed);
+    dma_display->setTextColor(cdB ? clrWhite : clrRed);
     dma_display->setCursor(46, 23); snprintf(buf, sizeof(buf), "%d", tbB); dma_display->print(buf);
   } else if (score.points[0] >= 3 && score.points[1] >= 3) {
     // Deuce/ADV: kein per-Team-Highlight (Text ist zentriert)
@@ -173,17 +167,15 @@ void updateDisplay() {
       dma_display->print(buf);
     }
   } else {
-    if (cdA) dma_display->fillRect(21, 22, 14, 10, clrWhite);
-    if (cdB) dma_display->fillRect(44, 22, 16, 10, clrWhite);
     dma_display->setTextColor(clrYellow);
     dma_display->setCursor(0, 23); dma_display->print("PKT");
     const char* pA = pointStr(score.points[0]);
     const char* pB = pointStr(score.points[1]);
-    dma_display->setTextColor(cdA ? clrBlack : clrGreen);
+    dma_display->setTextColor(cdA ? clrWhite : clrGreen);
     dma_display->setCursor(strlen(pA) == 1 ? 28 : 22, 23); dma_display->print(pA);
     dma_display->setTextColor(clrWhite);
     dma_display->setCursor(36, 23); dma_display->print("-");
-    dma_display->setTextColor(cdB ? clrBlack : clrRed);
+    dma_display->setTextColor(cdB ? clrWhite : clrRed);
     dma_display->setCursor(46, 23); dma_display->print(pB);
   }
 }
@@ -568,12 +560,32 @@ void setup() {
     delay(300);
   }
 
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(33, OUTPUT); digitalWrite(33, LOW);  // virtueller GND für Reset-Button
+
   logln("\n=== Team-Wahl: Erste 2 die drücken = Team A, letzte 2 = Team B ===\n");
   updateDisplay();
 }
 
 void loop() {
   ArduinoOTA.handle();
+
+  // Reset-Button (GPIO32): neues Spiel starten
+  static bool lastBtnState = HIGH;
+  bool btnState = digitalRead(RESET_BUTTON_PIN);
+  if (lastBtnState == HIGH && btnState == LOW) {
+    delay(20); // Entprellen
+    if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+      logln(">>> Reset: Neues Spiel (Teams bleiben)! <<<");
+      score = PadelScore();
+      undoStack.clear();
+      lastPointTime[0] = 0; lastPointTime[1] = 0;
+      lastUndoTime = 0;
+      phase = PLAYING;
+      printScore();
+    }
+  }
+  lastBtnState = btnState;
 
   // Eingehende Telnet-Bytes verwerfen (nur Ausgabe, keine Eingabe)
   while (TelnetStream.available()) TelnetStream.read();
