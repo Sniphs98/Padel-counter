@@ -35,7 +35,10 @@ uint16_t clrWhite, clrBlack, clrGreen, clrRed, clrYellow, clrCyan;
 #define UNDO_COOLDOWN_MS 5000   // Wartezeit nach einem Undo (ms)
 #define MAX_UNDO_HISTORY 10     // Wie viele Punkte man zurück kann
 #define DISPLAY_BRIGHTNESS 20   // Display-Helligkeit (0-255), niedrig = stromsparend
-#define RESET_BUTTON_PIN   32   // Reset-Button für neues Spiel (GPIO32)
+#define BTN_DEDUCT_B_PIN   32   // Punkt-Abzug Team B / rot (GPIO32)
+#define BTN_TEAM_A_PIN     18   // Manueller Punkt für Team A
+#define BTN_TEAM_B_PIN     21   // Manueller Punkt für Team B
+#define BTN_RESET_PIN2     34   // Reset-Button 2 (input-only, externer 10k Pull-up nötig!)
 
 // ── Padel Config ──────────────────────────────────────
 bool advantageEnabled = false;  // false = Golden Point bei Deuce (40:40)
@@ -223,6 +226,25 @@ void undoLastPoint() {
   undoStack.pop_back();
   phase = (score.matchWinner >= 0) ? MATCH_OVER : PLAYING;
   logln("<<< Letzter Punkt rückgängig gemacht! >>>");
+  printScore();
+}
+
+void deductPoint(int team) {
+  if (phase != PLAYING) return;
+  pushUndo();
+  if (score.inTiebreak) {
+    if (score.points[team] > 0) score.points[team]--;
+  } else if (score.advantage == team) {
+    score.advantage = -1;          // Vorteil weg → Deuce
+  } else if (score.advantage == (1 - team)) {
+    // gegnerischer Vorteil bleibt
+  } else if (score.points[team] > 0) {
+    score.points[team]--;
+  } else if (score.games[team] > 0) {
+    score.games[team]--;
+    score.points[team] = 3;        // zurück auf 40
+  }
+  logf("<<< Team %s: Punkt abgezogen! >>>\n", team == 0 ? "A" : "B");
   printScore();
 }
 
@@ -560,8 +582,11 @@ void setup() {
     delay(300);
   }
 
-  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
-  pinMode(33, OUTPUT); digitalWrite(33, LOW);  // virtueller GND für Reset-Button
+  pinMode(BTN_DEDUCT_B_PIN, INPUT_PULLUP);
+  pinMode(BTN_TEAM_A_PIN,   INPUT_PULLUP);
+  pinMode(BTN_TEAM_B_PIN,   INPUT_PULLUP);
+  pinMode(BTN_RESET_PIN2,   INPUT);  // input-only, kein interner Pull-up
+  pinMode(33, OUTPUT); digitalWrite(33, LOW);  // virtueller GND für alle Buttons
 
   logln("\n=== Team-Wahl: Erste 2 die drücken = Team A, letzte 2 = Team B ===\n");
   updateDisplay();
@@ -570,13 +595,47 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
 
-  // Reset-Button (GPIO32): neues Spiel starten
+  // Punkt-Abzug Team B (GPIO32)
   static bool lastBtnState = HIGH;
-  bool btnState = digitalRead(RESET_BUTTON_PIN);
+  bool btnState = digitalRead(BTN_DEDUCT_B_PIN);
   if (lastBtnState == HIGH && btnState == LOW) {
-    delay(20); // Entprellen
-    if (digitalRead(RESET_BUTTON_PIN) == LOW) {
-      logln(">>> Reset: Neues Spiel (Teams bleiben)! <<<");
+    delay(20);
+    if (digitalRead(BTN_DEDUCT_B_PIN) == LOW) deductPoint(1);
+  }
+  lastBtnState = btnState;
+
+  // Manuelle Punkt-Buttons (GPIO18 = Team A, GPIO21 = Team B)
+  static bool lastBtnA = HIGH, lastBtnB = HIGH;
+  bool btnA = digitalRead(BTN_TEAM_A_PIN);
+  bool btnB = digitalRead(BTN_TEAM_B_PIN);
+  if (lastBtnA == HIGH && btnA == LOW) {
+    delay(20);
+    if (digitalRead(BTN_TEAM_A_PIN) == LOW && phase == PLAYING) {
+      pushUndo();
+      lastPointTime[0] = millis();
+      logln(">>> [Button] Team A: Punkt! <<<");
+      scorePoint(0);
+    }
+  }
+  if (lastBtnB == HIGH && btnB == LOW) {
+    delay(20);
+    if (digitalRead(BTN_TEAM_B_PIN) == LOW && phase == PLAYING) {
+      pushUndo();
+      lastPointTime[1] = millis();
+      logln(">>> [Button] Team B: Punkt! <<<");
+      scorePoint(1);
+    }
+  }
+  lastBtnA = btnA;
+  lastBtnB = btnB;
+
+  // Reset-Button 2 (GPIO34, externer Pull-up)
+  static bool lastBtnReset2 = HIGH;
+  bool btnReset2 = digitalRead(BTN_RESET_PIN2);
+  if (lastBtnReset2 == HIGH && btnReset2 == LOW) {
+    delay(20);
+    if (digitalRead(BTN_RESET_PIN2) == LOW) {
+      logln(">>> [Button] Reset: Neues Spiel (Teams bleiben)! <<<");
       score = PadelScore();
       undoStack.clear();
       lastPointTime[0] = 0; lastPointTime[1] = 0;
@@ -585,7 +644,7 @@ void loop() {
       printScore();
     }
   }
-  lastBtnState = btnState;
+  lastBtnReset2 = btnReset2;
 
   // Eingehende Telnet-Bytes verwerfen (nur Ausgabe, keine Eingabe)
   while (TelnetStream.available()) TelnetStream.read();
