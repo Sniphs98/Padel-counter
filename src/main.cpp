@@ -239,7 +239,7 @@ void deductPoint(int team) {
   } else if (score.advantage == team) {
     score.advantage = -1;          // Vorteil weg → Deuce
   } else if (score.advantage == (1 - team)) {
-    // gegnerischer Vorteil bleibt
+    score.advantage = -1;          // gegnerischer Vorteil weg → Deuce
   } else if (score.points[team] > 0) {
     score.points[team]--;
   } else if (score.games[team] > 0) {
@@ -632,7 +632,7 @@ void loop() {
   lastBtnDeductB = btnDeductB;
 
   // Manuelle Punkt-Buttons (GPIO21 = Team B)
-  static bool lastBtnA = HIGH, lastBtnB = HIGH;
+  static bool lastBtnB = HIGH;
   bool btnB = digitalRead(BTN_TEAM_B_PIN);
   if (lastBtnB == HIGH && btnB == LOW) {
     delay(20);
@@ -645,7 +645,7 @@ void loop() {
   }
   lastBtnB = btnB;
 
-  // Reset-Button 2 (GPIO34, externer Pull-up)
+  // Reset-Button (GPIO18)
   static bool lastBtnReset2 = HIGH;
   bool btnReset2 = digitalRead(BTN_RESET_PIN2);
   if (lastBtnReset2 == HIGH && btnReset2 == LOW) {
