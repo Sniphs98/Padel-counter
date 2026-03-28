@@ -35,10 +35,11 @@ uint16_t clrWhite, clrBlack, clrGreen, clrRed, clrYellow, clrCyan;
 #define UNDO_COOLDOWN_MS 5000   // Wartezeit nach einem Undo (ms)
 #define MAX_UNDO_HISTORY 10     // Wie viele Punkte man zurück kann
 #define DISPLAY_BRIGHTNESS 20   // Display-Helligkeit (0-255), niedrig = stromsparend
-#define BTN_DEDUCT_B_PIN   32   // Punkt-Abzug Team B / rot (GPIO32)
-#define BTN_TEAM_A_PIN     18   // Manueller Punkt für Team A
-#define BTN_TEAM_B_PIN     21   // Manueller Punkt für Team B
-#define BTN_RESET_PIN2     34   // Reset-Button 2 (input-only, externer 10k Pull-up nötig!)
+#define BTN_TEAM_A_PIN     34   // Manueller Punkt für Team A (GPIO34, externer 10k Pull-up nötig!)
+#define BTN_DEDUCT_A_PIN   32   // Punkt-Abzug Team A (GPIO32)
+#define BTN_TEAM_B_PIN     35   // Manueller Punkt für Team B (GPIO35, externer 10k Pull-up nötig!)
+#define BTN_DEDUCT_B_PIN   21   // Punkt-Abzug Team B (GPIO21)
+#define BTN_RESET_PIN2     18   // Reset-Button (GPIO18)
 
 // ── Padel Config ──────────────────────────────────────
 bool advantageEnabled = false;  // false = Golden Point bei Deuce (40:40)
@@ -582,10 +583,11 @@ void setup() {
     delay(300);
   }
 
+  pinMode(BTN_TEAM_A_PIN,   INPUT);        // input-only, kein interner Pull-up
+  pinMode(BTN_DEDUCT_A_PIN, INPUT_PULLUP);
+  pinMode(BTN_TEAM_B_PIN,   INPUT);        // input-only, kein interner Pull-up
   pinMode(BTN_DEDUCT_B_PIN, INPUT_PULLUP);
-  pinMode(BTN_TEAM_A_PIN,   INPUT_PULLUP);
-  pinMode(BTN_TEAM_B_PIN,   INPUT_PULLUP);
-  pinMode(BTN_RESET_PIN2,   INPUT);  // input-only, kein interner Pull-up
+  pinMode(BTN_RESET_PIN2,   INPUT_PULLUP);
   pinMode(33, OUTPUT); digitalWrite(33, LOW);  // virtueller GND für alle Buttons
 
   logln("\n=== Team-Wahl: Erste 2 die drücken = Team A, letzte 2 = Team B ===\n");
@@ -595,20 +597,10 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
 
-  // Punkt-Abzug Team B (GPIO32)
+  // Manueller Punkt Team A (GPIO32)
   static bool lastBtnState = HIGH;
-  bool btnState = digitalRead(BTN_DEDUCT_B_PIN);
+  bool btnState = digitalRead(BTN_TEAM_A_PIN);
   if (lastBtnState == HIGH && btnState == LOW) {
-    delay(20);
-    if (digitalRead(BTN_DEDUCT_B_PIN) == LOW) deductPoint(1);
-  }
-  lastBtnState = btnState;
-
-  // Manuelle Punkt-Buttons (GPIO18 = Team A, GPIO21 = Team B)
-  static bool lastBtnA = HIGH, lastBtnB = HIGH;
-  bool btnA = digitalRead(BTN_TEAM_A_PIN);
-  bool btnB = digitalRead(BTN_TEAM_B_PIN);
-  if (lastBtnA == HIGH && btnA == LOW) {
     delay(20);
     if (digitalRead(BTN_TEAM_A_PIN) == LOW && phase == PLAYING) {
       pushUndo();
@@ -617,6 +609,29 @@ void loop() {
       scorePoint(0);
     }
   }
+  lastBtnState = btnState;
+
+  // Gehäuse-Button Punkt-Abzug Team A (GPIO34, externer Pull-up)
+  static bool lastBtnDeductA = HIGH;
+  bool btnDeductA = digitalRead(BTN_DEDUCT_A_PIN);
+  if (lastBtnDeductA == HIGH && btnDeductA == LOW) {
+    delay(20);
+    if (digitalRead(BTN_DEDUCT_A_PIN) == LOW) deductPoint(0);
+  }
+  lastBtnDeductA = btnDeductA;
+
+  // Gehäuse-Button Punkt-Abzug Team B (GPIO35, externer Pull-up)
+  static bool lastBtnDeductB = HIGH;
+  bool btnDeductB = digitalRead(BTN_DEDUCT_B_PIN);
+  if (lastBtnDeductB == HIGH && btnDeductB == LOW) {
+    delay(20);
+    if (digitalRead(BTN_DEDUCT_B_PIN) == LOW) deductPoint(1);
+  }
+  lastBtnDeductB = btnDeductB;
+
+  // Manuelle Punkt-Buttons (GPIO21 = Team B)
+  static bool lastBtnA = HIGH, lastBtnB = HIGH;
+  bool btnB = digitalRead(BTN_TEAM_B_PIN);
   if (lastBtnB == HIGH && btnB == LOW) {
     delay(20);
     if (digitalRead(BTN_TEAM_B_PIN) == LOW && phase == PLAYING) {
@@ -626,14 +641,13 @@ void loop() {
       scorePoint(1);
     }
   }
-  lastBtnA = btnA;
   lastBtnB = btnB;
 
   // Reset-Button 2 (GPIO34, externer Pull-up)
   static bool lastBtnReset2 = HIGH;
   bool btnReset2 = digitalRead(BTN_RESET_PIN2);
   if (lastBtnReset2 == HIGH && btnReset2 == LOW) {
-    delay(20);
+    delay(100);
     if (digitalRead(BTN_RESET_PIN2) == LOW) {
       logln(">>> [Button] Reset: Neues Spiel (Teams bleiben)! <<<");
       score = PadelScore();
@@ -659,14 +673,20 @@ void loop() {
     updateDisplay();
   }
 
+  static unsigned long lastReconnectAttempt[MAX_REMOTES] = {0};
   for (int i = 0; i < (int)foundAddresses.size(); i++) {
     bool connected = clientConnected[i] && clients[i] != nullptr && clients[i]->isConnected();
     if (!connected) {
-      if (clientConnected[i]) logf("Spieler %d getrennt! Reconnect...\n", i + 1);
-      clientConnected[i] = false;
-      delay(1000);
-      connectRemote(i);
+      if (clientConnected[i]) {
+        logf("Spieler %d getrennt!\n", i + 1);
+        clientConnected[i] = false;
+      }
+      if (millis() - lastReconnectAttempt[i] >= 2000) {
+        lastReconnectAttempt[i] = millis();
+        logf("Spieler %d Reconnect...\n", i + 1);
+        connectRemote(i);
+      }
     }
   }
-  delay(500);
+  delay(10);
 }
