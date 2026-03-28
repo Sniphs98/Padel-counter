@@ -40,6 +40,7 @@ uint16_t clrWhite, clrBlack, clrGreen, clrRed, clrYellow, clrCyan;
 #define BTN_TEAM_B_PIN     35   // Manueller Punkt für Team B (GPIO35, externer 10k Pull-up nötig!)
 #define BTN_DEDUCT_B_PIN   21   // Punkt-Abzug Team B (GPIO21)
 #define BTN_RESET_PIN2     18   // Reset-Button (GPIO18)
+#define SW_ADVANTAGE_PIN   39   // Kipschalter Vorteil-Regel (GPIO39, externer 10k Pull-up)
 
 // ── Padel Config ──────────────────────────────────────
 bool advantageEnabled = false;  // false = Golden Point bei Deuce (40:40)
@@ -588,6 +589,7 @@ void setup() {
   pinMode(BTN_TEAM_B_PIN,   INPUT);        // input-only, kein interner Pull-up
   pinMode(BTN_DEDUCT_B_PIN, INPUT_PULLUP);
   pinMode(BTN_RESET_PIN2,   INPUT_PULLUP);
+  pinMode(SW_ADVANTAGE_PIN, INPUT);        // input-only, kein interner Pull-up
   pinMode(33, OUTPUT); digitalWrite(33, LOW);  // virtueller GND für alle Buttons
 
   logln("\n=== Team-Wahl: Erste 2 die drücken = Team A, letzte 2 = Team B ===\n");
@@ -659,6 +661,9 @@ void loop() {
     }
   }
   lastBtnReset2 = btnReset2;
+
+  // Kipschalter Vorteil-Regel (GPIO39)
+  advantageEnabled = (digitalRead(SW_ADVANTAGE_PIN) == LOW);
 
   // Eingehende Telnet-Bytes verwerfen (nur Ausgabe, keine Eingabe)
   while (TelnetStream.available()) TelnetStream.read();
