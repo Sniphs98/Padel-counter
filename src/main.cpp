@@ -478,6 +478,29 @@ class ScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
   }
 };
 
+// ── BLE Reconnect Task (Core 0, non-blocking für loop) ───────────────────────
+static void reconnectTask(void*) {
+  static unsigned long lastReconnectAttempt[MAX_REMOTES] = {0};
+  for (;;) {
+    for (int i = 0; i < (int)foundAddresses.size(); i++) {
+      bool connected = clientConnected[i] && clients[i] != nullptr && clients[i]->isConnected();
+      if (!connected) {
+        if (clientConnected[i]) {
+          logf("Spieler %d getrennt!\n", i + 1);
+          clientConnected[i] = false;
+        }
+        unsigned long now = millis();
+        if (now - lastReconnectAttempt[i] >= 2000) {
+          lastReconnectAttempt[i] = now;
+          logf("Spieler %d Reconnect...\n", i + 1);
+          connectRemote(i);
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+}
+
 // ── Setup / Loop ──────────────────────────────────────
 void setup() {
   Serial.begin(921600);
@@ -584,6 +607,8 @@ void setup() {
     delay(300);
   }
 
+  xTaskCreatePinnedToCore(reconnectTask, "ble_reconnect", 4096, nullptr, 1, nullptr, 0);
+
   pinMode(BTN_TEAM_A_PIN,   INPUT);        // input-only, kein interner Pull-up
   pinMode(BTN_DEDUCT_A_PIN, INPUT_PULLUP);
   pinMode(BTN_TEAM_B_PIN,   INPUT);        // input-only, kein interner Pull-up
@@ -678,20 +703,5 @@ void loop() {
     updateDisplay();
   }
 
-  static unsigned long lastReconnectAttempt[MAX_REMOTES] = {0};
-  for (int i = 0; i < (int)foundAddresses.size(); i++) {
-    bool connected = clientConnected[i] && clients[i] != nullptr && clients[i]->isConnected();
-    if (!connected) {
-      if (clientConnected[i]) {
-        logf("Spieler %d getrennt!\n", i + 1);
-        clientConnected[i] = false;
-      }
-      if (millis() - lastReconnectAttempt[i] >= 2000) {
-        lastReconnectAttempt[i] = millis();
-        logf("Spieler %d Reconnect...\n", i + 1);
-        connectRemote(i);
-      }
-    }
-  }
   delay(10);
 }
