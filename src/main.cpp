@@ -597,18 +597,7 @@ void setup() {
 
   logf("\n%d Remote(s) gefunden.\n", (int)foundAddresses.size());
 
-  if (foundAddresses.empty()) {
-    logln("Keine Remotes gefunden! ESP32 neu starten.");
-    return;
-  }
-
-  for (int i = 0; i < (int)foundAddresses.size(); i++) {
-    connectRemote(i);
-    delay(300);
-  }
-
-  xTaskCreatePinnedToCore(reconnectTask, "ble_reconnect", 4096, nullptr, 1, nullptr, 0);
-
+  // Buttons immer konfigurieren — auch ohne Remotes
   pinMode(BTN_TEAM_A_PIN,   INPUT);        // input-only, kein interner Pull-up
   pinMode(BTN_DEDUCT_A_PIN, INPUT_PULLUP);
   pinMode(BTN_TEAM_B_PIN,   INPUT);        // input-only, kein interner Pull-up
@@ -617,8 +606,19 @@ void setup() {
   pinMode(SW_ADVANTAGE_PIN, INPUT);        // input-only, kein interner Pull-up
   pinMode(33, OUTPUT); digitalWrite(33, LOW);  // virtueller GND für alle Buttons
 
-  logln("\n=== Team-Wahl: Erste 2 die drücken = Team A, letzte 2 = Team B ===\n");
-  updateDisplay();
+  if (foundAddresses.empty()) {
+    logln("Keine Remotes gefunden — starte ohne BLE, Gehäuse-Buttons aktiv.");
+    phase = PLAYING;
+    printScore();
+  } else {
+    for (int i = 0; i < (int)foundAddresses.size(); i++) {
+      connectRemote(i);
+      delay(300);
+    }
+    xTaskCreatePinnedToCore(reconnectTask, "ble_reconnect", 4096, nullptr, 1, nullptr, 0);
+    logln("\n=== Team-Wahl: Erste 2 die drücken = Team A, letzte 2 = Team B ===\n");
+    updateDisplay();
+  }
 }
 
 void loop() {
