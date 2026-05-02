@@ -64,9 +64,11 @@ struct PadelScore {
   bool inTiebreak  = false;
   int  matchWinner = -1;
   int  serveTeam   = 0;       // 0 = Team A hat Aufschlag, 1 = Team B
+  bool serveRight  = true;    // true = Aufschlag von rechts (Deuce-Seite)
 } score;
 
 std::vector<PadelScore> undoStack;
+std::vector<int> undoTeamStack;
 static SemaphoreHandle_t g_mutex;
 
 // ── Anzeige ───────────────────────────────────────────
@@ -138,6 +140,9 @@ void updateDisplay() {
   dma_display->setCursor(36, 1); dma_display->print("-");
   dma_display->setTextColor(cdB ? clrWhite : clrRed);
   dma_display->setCursor(46, 1); snprintf(buf, sizeof(buf), "%d", score.sets[1]); dma_display->print(buf);
+  // Aufschlagseite
+  dma_display->setTextColor(score.serveTeam == 0 ? (cdA ? clrWhite : clrGreen) : (cdB ? clrWhite : clrRed));
+  dma_display->setCursor(58, 1); dma_display->print(score.serveRight ? "R" : "L");
 
   // Zeile 2: Spiel
   dma_display->setTextColor(clrYellow);
@@ -190,6 +195,7 @@ void printScore() {
   logln();
   logf("  Sätze:  A:%d - B:%d\n", score.sets[0], score.sets[1]);
   logf("  Spiele: A:%d - B:%d\n", score.games[0], score.games[1]);
+  logf("  Aufschlag: Team %s von %s\n", score.serveTeam == 0 ? "A" : "B", score.serveRight ? "Rechts" : "Links");
 
   if (score.inTiebreak) {
     logf("  Tiebreak: A:%d - B:%d\n", score.points[0], score.points[1]);
@@ -207,13 +213,16 @@ void printScore() {
 }
 
 // ── Undo ──────────────────────────────────────────────
-void pushUndo() {
-  if ((int)undoStack.size() >= MAX_UNDO_HISTORY)
+void pushUndo(int team) {
+  if ((int)undoStack.size() >= MAX_UNDO_HISTORY) {
     undoStack.erase(undoStack.begin());
+    undoTeamStack.erase(undoTeamStack.begin());
+  }
   undoStack.push_back(score);
+  undoTeamStack.push_back(team);
 }
 
-void undoLastPoint() {
+void undoLastPoint(int team) {
   unsigned long now = millis();
   long remaining = UNDO_COOLDOWN_MS - (long)(now - lastUndoTime);
   if (remaining > 0) {
@@ -224,9 +233,14 @@ void undoLastPoint() {
     logln("Undo: Kein Punkt zum Rückgängigmachen!");
     return;
   }
+  if (undoTeamStack.back() != team) {
+    logf("Undo: Team %s kann nur eigene Punkte zurücknehmen!\n", team == 0 ? "A" : "B");
+    return;
+  }
   lastUndoTime = now;
   score = undoStack.back();
   undoStack.pop_back();
+  undoTeamStack.pop_back();
   phase = (score.matchWinner >= 0) ? MATCH_OVER : PLAYING;
   logln("<<< Letzter Punkt rückgängig gemacht! >>>");
   printScore();
@@ -234,7 +248,7 @@ void undoLastPoint() {
 
 void deductPoint(int team) {
   if (phase != PLAYING) return;
-  pushUndo();
+  pushUndo(team);
   if (score.inTiebreak) {
     if (score.points[team] > 0) score.points[team]--;
   } else if (score.advantage == team) {
@@ -260,6 +274,7 @@ void winGame(int team) {
   score.advantage  = -1;
   score.inTiebreak = false;
   score.serveTeam  = 1 - score.serveTeam;  // Aufschlag wechseln
+  score.serveRight = true;                  // neues Spiel immer von rechts
   score.games[team]++;
 
   int g  = score.games[team];
@@ -318,10 +333,12 @@ void scorePoint(int team) {
     // Aufschlag: erster Wechsel nach 1 Punkt, dann alle 2 Punkte
     if (total == 1 || (total > 1 && total % 2 == 1))
       score.serveTeam = 1 - score.serveTeam;
-    if (score.points[team] >= 7 && score.points[team] - score.points[other] >= 2)
-      winGame(team);
-    else
+    if (score.points[team] >= 7 && score.points[team] - score.points[other] >= 2) {
+      winGame(team);                  // winGame setzt serveRight = true
+    } else {
+      score.serveRight = !score.serveRight;
       printScore();
+    }
     return;
   }
 
@@ -332,9 +349,11 @@ void scorePoint(int team) {
     } else if (score.advantage == team) {
       winGame(team);                  // Hatte Vorteil → Spiel
     } else if (score.advantage == other) {
+      score.serveRight = !score.serveRight;
       score.advantage = -1;           // Gegner verliert Vorteil → Deuce
       printScore();
     } else {
+      score.serveRight = !score.serveRight;
       score.advantage = team;         // Deuce → Vorteil
       printScore();
     }
@@ -343,10 +362,12 @@ void scorePoint(int team) {
 
   // Normaler Punkt
   score.points[team]++;
-  if (score.points[team] >= 4)
-    winGame(team);
-  else
+  if (score.points[team] >= 4) {
+    winGame(team);                    // winGame setzt serveRight = true
+  } else {
+    score.serveRight = !score.serveRight;
     printScore();
+  }
 }
 
 // ── Button Handler ────────────────────────────────────
@@ -397,7 +418,7 @@ void onButtonPress(int playerIndex) {
   }
 
   lastPointTime[team] = now;
-  pushUndo();
+  pushUndo(team);
   logf(">>> Team %s: Punkt! <<<\n", team == 0 ? "A" : "B");
   scorePoint(team);
 }
@@ -443,7 +464,7 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t le
   }
 
   if (isButton2)
-    undoLastPoint();
+    undoLastPoint(teamOf[playerIndex]);
   else
     onButtonPress(playerIndex);
   xSemaphoreGive(g_mutex);
@@ -608,7 +629,7 @@ void loop() {
     if (digitalRead(BTN_TEAM_A_PIN) == LOW) {
       xSemaphoreTake(g_mutex, portMAX_DELAY);
       if (phase == PLAYING) {
-        pushUndo();
+        pushUndo(0);
         lastPointTime[0] = millis();
         logln(">>> [Button] Team A: Punkt! <<<");
         scorePoint(0);
@@ -652,7 +673,7 @@ void loop() {
     if (digitalRead(BTN_TEAM_B_PIN) == LOW) {
       xSemaphoreTake(g_mutex, portMAX_DELAY);
       if (phase == PLAYING) {
-        pushUndo();
+        pushUndo(1);
         lastPointTime[1] = millis();
         logln(">>> [Button] Team B: Punkt! <<<");
         scorePoint(1);
