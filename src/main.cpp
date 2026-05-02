@@ -1,14 +1,7 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
-#include <WiFi.h>
-#include <ArduinoOTA.h>
-#include <TelnetStream.h>
-
-// ── WiFi / OTA ────────────────────────────────────────
-#include "credentials.h"  // nicht in Git — siehe credentials.h.example
-
-// ── Log-Helper: Serial + Telnet gleichzeitig ──────────
+// ── Log-Helper ────────────────────────────────────────
 void logf(const char* fmt, ...) {
   char buf[256];
   va_list args;
@@ -16,12 +9,10 @@ void logf(const char* fmt, ...) {
   vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
   Serial.print(buf);
-  TelnetStream.print(buf);
 }
 
 void logln(const char* msg = "") {
   Serial.println(msg);
-  TelnetStream.println(msg);
 }
 
 // ── Display ───────────────────────────────────────────
@@ -43,7 +34,7 @@ uint16_t clrWhite, clrBlack, clrGreen, clrRed, clrYellow, clrCyan;
 #define SW_ADVANTAGE_PIN   39   // Kipschalter Vorteil-Regel (GPIO39, externer 10k Pull-up)
 
 // ── Padel Config ──────────────────────────────────────
-bool advantageEnabled = false;  // false = Golden Point bei Deuce (40:40)
+volatile bool advantageEnabled = false;  // false = Golden Point bei Deuce (40:40)
 
 // ── BLE ───────────────────────────────────────────────
 static NimBLEUUID hidServiceUUID((uint16_t)0x1812);
@@ -72,9 +63,11 @@ struct PadelScore {
   int  advantage   = -1;      // -1 = keiner/deuce, 0 = Team A, 1 = Team B
   bool inTiebreak  = false;
   int  matchWinner = -1;
+  int  serveTeam   = 0;       // 0 = Team A hat Aufschlag, 1 = Team B
 } score;
 
 std::vector<PadelScore> undoStack;
+static SemaphoreHandle_t g_mutex;
 
 // ── Anzeige ───────────────────────────────────────────
 bool isTeamInCooldown(int team) {
@@ -128,9 +121,17 @@ void updateDisplay() {
   bool cdA = isTeamInCooldown(0);
   bool cdB = isTeamInCooldown(1);
 
-  // Zeile 1: Satz
+  // Zeile 1: Satz + Aufschlaganzeige
   dma_display->setTextColor(clrYellow);
   dma_display->setCursor(0, 1);  dma_display->print("SAT");
+  // Aufschlag-Pfeil: ">" vor dem aufschlagenden Team
+  if (score.serveTeam == 0) {
+    dma_display->setTextColor(cdA ? clrWhite : clrGreen);
+    dma_display->setCursor(22, 1); dma_display->print(">");
+  } else {
+    dma_display->setTextColor(cdB ? clrWhite : clrRed);
+    dma_display->setCursor(40, 1); dma_display->print(">");
+  }
   dma_display->setTextColor(cdA ? clrWhite : clrGreen);
   dma_display->setCursor(28, 1); snprintf(buf, sizeof(buf), "%d", score.sets[0]); dma_display->print(buf);
   dma_display->setTextColor(clrWhite);
@@ -258,6 +259,7 @@ void winGame(int team) {
   score.points[1] = 0;
   score.advantage  = -1;
   score.inTiebreak = false;
+  score.serveTeam  = 1 - score.serveTeam;  // Aufschlag wechseln
   score.games[team]++;
 
   int g  = score.games[team];
@@ -312,6 +314,10 @@ void scorePoint(int team) {
   // Tiebreak
   if (score.inTiebreak) {
     score.points[team]++;
+    int total = score.points[0] + score.points[1];
+    // Aufschlag: erster Wechsel nach 1 Punkt, dann alle 2 Punkte
+    if (total == 1 || (total > 1 && total % 2 == 1))
+      score.serveTeam = 1 - score.serveTeam;
     if (score.points[team] >= 7 && score.points[team] - score.points[other] >= 2)
       winGame(team);
     else
@@ -400,8 +406,10 @@ void onButtonPress(int playerIndex) {
 void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
   if (length < 1) return;
 
+  xSemaphoreTake(g_mutex, portMAX_DELAY);
+
   auto it = charToPlayer.find(pChar);
-  if (it == charToPlayer.end()) return;
+  if (it == charToPlayer.end()) { xSemaphoreGive(g_mutex); return; }
   int playerIndex = it->second;
 
   // Bekannte HID-Codes:
@@ -430,6 +438,7 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t le
       for (int i = 0; i < length; i++) logf("%02X ", pData[i]);
       logln();
     }
+    xSemaphoreGive(g_mutex);
     return;
   }
 
@@ -437,6 +446,7 @@ void notifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t le
     undoLastPoint();
   else
     onButtonPress(playerIndex);
+  xSemaphoreGive(g_mutex);
 }
 
 bool connectRemote(int index) {
@@ -455,14 +465,27 @@ bool connectRemote(int index) {
   if (pService == nullptr) { clients[index]->disconnect(); return false; }
 
   auto* chars = pService->getCharacteristics(true);
+
+  // subscribe() ist blockierend (wartet auf BLE-ACK) — darf keinen Mutex halten,
+  // sonst Deadlock wenn notifyCallback gleichzeitig g_mutex anfordert
+  std::vector<NimBLERemoteCharacteristic*> subscribed;
   for (auto pChar : *chars) {
     if (pChar->getUUID().equals(hidReportUUID) && pChar->canNotify()) {
       pChar->subscribe(true, notifyCallback);
-      charToPlayer[pChar] = index;
+      subscribed.push_back(pChar);
     }
   }
 
+  xSemaphoreTake(g_mutex, portMAX_DELAY);
+  for (auto it = charToPlayer.begin(); it != charToPlayer.end(); ) {
+    if (it->second == index) it = charToPlayer.erase(it);
+    else ++it;
+  }
+  for (auto pChar : subscribed) {
+    charToPlayer[pChar] = index;
+  }
   clientConnected[index] = true;
+  xSemaphoreGive(g_mutex);
   logf("Spieler %d verbunden!\n", index + 1);
   return true;
 }
@@ -503,6 +526,7 @@ static void reconnectTask(void*) {
 
 // ── Setup / Loop ──────────────────────────────────────
 void setup() {
+  g_mutex = xSemaphoreCreateMutex();
   Serial.begin(921600);
   Serial.println("\n=== Padel Counter ===");
 
@@ -518,51 +542,6 @@ void setup() {
   clrRed    = dma_display->color565(255, 50,  50);
   clrYellow = dma_display->color565(180, 180, 0);
   clrCyan   = dma_display->color565(0,   200, 255);
-
-  // WiFi verbinden
-  dma_display->clearScreen();
-  dma_display->setTextSize(1);
-  dma_display->setTextWrap(false);
-  dma_display->setTextColor(clrYellow);
-  dma_display->setCursor(13, 8);  dma_display->print("Padel");
-  dma_display->setTextColor(clrCyan);
-  dma_display->setCursor(4, 20);  dma_display->print("WiFi...");
-
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("WiFi verbinde mit %s", WIFI_SSID);
-  int wifiRetry = 0;
-  while (WiFi.status() != WL_CONNECTED && wifiRetry < 20) {
-    delay(500);
-    Serial.print(".");
-    wifiRetry++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\nWiFi verbunden! IP: %s\n", WiFi.localIP().toString().c_str());
-
-    // OTA konfigurieren
-    ArduinoOTA.setHostname("padel-counter");
-    ArduinoOTA.setPassword(OTA_PASS);
-    ArduinoOTA.onStart([]() {
-      logln("OTA: Flash startet...");
-    });
-    ArduinoOTA.onEnd([]() {
-      logln("\nOTA: Fertig! Neustart...");
-    });
-    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-      logf("OTA: %u%%\r", progress / (total / 100));
-    });
-    ArduinoOTA.onError([](ota_error_t error) {
-      logf("OTA Fehler [%u]\n", error);
-    });
-    ArduinoOTA.begin();
-
-    // Telnet Console starten (Port 23)
-    TelnetStream.begin(23);
-    logln("Telnet Console aktiv (Port 23)");
-  } else {
-    Serial.println("\nWiFi fehlgeschlagen — OTA/Telnet nicht verfügbar.");
-  }
 
   logf("Vorteil-Regel: %s\n", advantageEnabled ? "AN" : "AUS (Golden Point)");
   logf("Schalte alle %d Remotes ein! Scan läuft %d Sek...\n", MAX_REMOTES, SCAN_DURATION);
@@ -591,7 +570,6 @@ void setup() {
     snprintf(buf, sizeof(buf), "Noch: %ds", t);
     dma_display->setCursor(0, 23); dma_display->print(buf);
     pScan->start(1, t < SCAN_DURATION);
-    ArduinoOTA.handle();
     if ((int)foundAddresses.size() >= MAX_REMOTES) break;
   }
 
@@ -615,25 +593,27 @@ void setup() {
       connectRemote(i);
       delay(300);
     }
-    xTaskCreatePinnedToCore(reconnectTask, "ble_reconnect", 4096, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(reconnectTask, "ble_reconnect", 8192, nullptr, 1, nullptr, 0);
     logln("\n=== Team-Wahl: Erste 2 die drücken = Team A, letzte 2 = Team B ===\n");
     updateDisplay();
   }
 }
 
 void loop() {
-  ArduinoOTA.handle();
-
   // Manueller Punkt Team A (GPIO32)
   static bool lastBtnState = HIGH;
   bool btnState = digitalRead(BTN_TEAM_A_PIN);
   if (lastBtnState == HIGH && btnState == LOW) {
     delay(20);
-    if (digitalRead(BTN_TEAM_A_PIN) == LOW && phase == PLAYING) {
-      pushUndo();
-      lastPointTime[0] = millis();
-      logln(">>> [Button] Team A: Punkt! <<<");
-      scorePoint(0);
+    if (digitalRead(BTN_TEAM_A_PIN) == LOW) {
+      xSemaphoreTake(g_mutex, portMAX_DELAY);
+      if (phase == PLAYING) {
+        pushUndo();
+        lastPointTime[0] = millis();
+        logln(">>> [Button] Team A: Punkt! <<<");
+        scorePoint(0);
+      }
+      xSemaphoreGive(g_mutex);
     }
   }
   lastBtnState = btnState;
@@ -643,7 +623,11 @@ void loop() {
   bool btnDeductA = digitalRead(BTN_DEDUCT_A_PIN);
   if (lastBtnDeductA == HIGH && btnDeductA == LOW) {
     delay(20);
-    if (digitalRead(BTN_DEDUCT_A_PIN) == LOW) deductPoint(0);
+    if (digitalRead(BTN_DEDUCT_A_PIN) == LOW) {
+      xSemaphoreTake(g_mutex, portMAX_DELAY);
+      deductPoint(0);
+      xSemaphoreGive(g_mutex);
+    }
   }
   lastBtnDeductA = btnDeductA;
 
@@ -652,7 +636,11 @@ void loop() {
   bool btnDeductB = digitalRead(BTN_DEDUCT_B_PIN);
   if (lastBtnDeductB == HIGH && btnDeductB == LOW) {
     delay(20);
-    if (digitalRead(BTN_DEDUCT_B_PIN) == LOW) deductPoint(1);
+    if (digitalRead(BTN_DEDUCT_B_PIN) == LOW) {
+      xSemaphoreTake(g_mutex, portMAX_DELAY);
+      deductPoint(1);
+      xSemaphoreGive(g_mutex);
+    }
   }
   lastBtnDeductB = btnDeductB;
 
@@ -661,11 +649,15 @@ void loop() {
   bool btnB = digitalRead(BTN_TEAM_B_PIN);
   if (lastBtnB == HIGH && btnB == LOW) {
     delay(20);
-    if (digitalRead(BTN_TEAM_B_PIN) == LOW && phase == PLAYING) {
-      pushUndo();
-      lastPointTime[1] = millis();
-      logln(">>> [Button] Team B: Punkt! <<<");
-      scorePoint(1);
+    if (digitalRead(BTN_TEAM_B_PIN) == LOW) {
+      xSemaphoreTake(g_mutex, portMAX_DELAY);
+      if (phase == PLAYING) {
+        pushUndo();
+        lastPointTime[1] = millis();
+        logln(">>> [Button] Team B: Punkt! <<<");
+        scorePoint(1);
+      }
+      xSemaphoreGive(g_mutex);
     }
   }
   lastBtnB = btnB;
@@ -676,6 +668,7 @@ void loop() {
   if (lastBtnReset2 == HIGH && btnReset2 == LOW) {
     delay(100);
     if (digitalRead(BTN_RESET_PIN2) == LOW) {
+      xSemaphoreTake(g_mutex, portMAX_DELAY);
       logln(">>> [Button] Reset: Neues Spiel (Teams bleiben)! <<<");
       score = PadelScore();
       undoStack.clear();
@@ -683,6 +676,7 @@ void loop() {
       lastUndoTime = 0;
       phase = PLAYING;
       printScore();
+      xSemaphoreGive(g_mutex);
     }
   }
   lastBtnReset2 = btnReset2;
@@ -690,17 +684,18 @@ void loop() {
   // Kipschalter Vorteil-Regel (GPIO39)
   advantageEnabled = (digitalRead(SW_ADVANTAGE_PIN) == LOW);
 
-  // Eingehende Telnet-Bytes verwerfen (nur Ausgabe, keine Eingabe)
-  while (TelnetStream.available()) TelnetStream.read();
-
   // Display aktualisieren wenn Cooldown abläuft
   static bool wasCdA = false, wasCdB = false;
+  xSemaphoreTake(g_mutex, portMAX_DELAY);
   bool cdA = isTeamInCooldown(0);
   bool cdB = isTeamInCooldown(1);
-  if (wasCdA != cdA || wasCdB != cdB) {
-    wasCdA = cdA;
-    wasCdB = cdB;
+  bool cooldownChanged = (wasCdA != cdA || wasCdB != cdB);
+  if (cooldownChanged) { wasCdA = cdA; wasCdB = cdB; }
+  xSemaphoreGive(g_mutex);
+  if (cooldownChanged) {
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
     updateDisplay();
+    xSemaphoreGive(g_mutex);
   }
 
   delay(10);
